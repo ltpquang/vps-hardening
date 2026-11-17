@@ -43,6 +43,15 @@ class PureTests(unittest.TestCase):
         self.assertIn('nftables[type=multiport]', values[p.PATHS[5]])
         self.assertIn('backend = systemd', values[p.PATHS[5]])
 
+    def test_plan_and_apply_accept_the_same_rollback_window(self):
+        for command in ('plan', 'apply'):
+            with self.subTest(command=command):
+                self.assertEqual(p.parser().parse_args([command]).rollback_minutes, 20)
+                self.assertEqual(p.parser().parse_args([command, '--rollback-minutes', '30']).rollback_minutes, 30)
+                for value in ('4', '121', 'not-a-number'):
+                    with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                        p.parser().parse_args([command, '--rollback-minutes', value])
+
     def test_reserved_and_invalid_ports_rejected(self):
         for value in (0, -1, 65536, 'oops', 80, 443, 3000, 2375, 6379):
             with self.subTest(value=value), self.assertRaises(p.Error):
@@ -274,10 +283,12 @@ class FileAndTransactionTests(unittest.TestCase):
         self.disarm.assert_not_called()
 
     def test_plan_does_not_write_files_or_run_package_changes(self):
-        args = argparse.Namespace(skip_packages=True)
+        args = p.parser().parse_args(['plan', '--skip-packages', '--rollback-minutes', '30'])
         original = set(self.root.rglob('*'))
-        with patch.object(p, 'preflight', return_value=self.base), contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(p, 'preflight', return_value=self.base), contextlib.redirect_stdout(io.StringIO()) as output:
             p.plan(args)
+        self.assertIn('Rollback window: 30 minutes', output.getvalue())
+        self.assertIn('no timer is armed by plan', output.getvalue())
         self.assertEqual(set(self.root.rglob('*')), original)
         self.assertEqual(self.commands, [])
 

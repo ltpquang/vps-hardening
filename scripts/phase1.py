@@ -445,6 +445,7 @@ def plan(args):
     state = preflight(args)
     print(json.dumps(state, indent=2))
     print('\nPLAN ONLY: no files, packages, services, or firewall rules changed.')
+    print(f'Rollback window: {args.rollback_minutes} minutes after package operations; no timer is armed by plan.')
     print('Packages:', 'unchanged (--skip-packages)' if args.skip_packages else
           'apt update, upgrade (preserve configuration), install ' + ' '.join(PACKAGES))
     for name, content in configuration(state['interfaces'], state['stage_ports']).items():
@@ -901,8 +902,8 @@ def parser():
         p.add_argument('--interface', action='append', default=[], help='Repeat for each public uplink; otherwise detected')
         p.add_argument('--skip-packages', action='store_true', help='For already-patched hosts with all prerequisites installed')
         p.add_argument('--migrate-ufw', action='store_true', help='Replace reviewed live/custom UFW policy with the SSH-only guard')
-        if mode == 'apply':
-            p.add_argument('--rollback-minutes', type=int, default=20, choices=range(5, 121), metavar='5..120')
+        p.add_argument('--rollback-minutes', type=int, default=20, choices=range(5, 121), metavar='5..120',
+                       help='Confirmation window after package operations; plan previews it without arming a timer')
     for mode in ('verify', 'commit', 'rollback'):
         p = sub.add_parser(mode)
         p.add_argument('--run-id', required=True)

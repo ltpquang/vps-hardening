@@ -192,7 +192,7 @@ sudo /usr/bin/python3 /root/bootstrap/phase1.py plan --admin ubuntu
 | Repeated `--interface` | Include each public uplink |
 | `--migrate-ufw` | Replace a reviewed live or custom UFW policy |
 | `--skip-packages` | Skip package operations on an already-patched host with prerequisites installed |
-| `--rollback-minutes 30` | Extend the apply deadline to 30 minutes |
+| `--rollback-minutes 30` | Preview or apply a 30-minute confirmation window |
 
 For example, a migration on an `ens3` host is previewed with:
 
@@ -226,7 +226,7 @@ sudo /usr/bin/python3 /root/bootstrap/phase1.py apply --admin ubuntu
 
 **Success:** `STAGED RUN: RUN_ID` appears with a rollback deadline, backup directory, and next commands. Configuration awaits confirmation; both old and selected SSH ports remain permitted. Continue with a new SSH session before the deadline.
 
-If using the migration preview above, add `--interface ens3 --ssh-port 2222` to apply as well. `--rollback-minutes` accepts 5 through 120 minutes. Allow enough time for the external checks.
+If using the migration preview above, add `--interface ens3 --ssh-port 2222` to apply as well. `--rollback-minutes` accepts 5 through 120 minutes in both `plan` and `apply`. Planning displays the window without arming a timer; repeat the option when applying because plans are not saved. Allow enough time for the external checks.
 
 **Record the actual run ID outside the VPS.** In the following commands, replace every `RUN_ID` with that value. Run directories live under `/var/lib/vps-phase1/` and contain root-only backups, state, and a saved copy of the script. They can contain sensitive configuration and login metadata.
 
