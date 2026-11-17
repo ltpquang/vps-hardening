@@ -43,7 +43,7 @@ Examples use `ubuntu`. **That is a username**, common on Ubuntu cloud images, ra
 | SSH source addresses | Unrestricted; repeated failures subject to Fail2ban |
 | SSH forwarding | Local TCP forwarding retained for private setup; agent and X11 forwarding disabled |
 
-**Fresh-host boundaries:** the script refuses Docker installations, listeners on 80/443/3000, active or enabled UFW/firewalld/distribution nftables services, and unrecognized nftables tables. It recognizes its own `inet vps_edge` table and Fail2ban's `inet f2b-table`. Existing SSH settings that override its policy cause validation to fail.
+**Fresh-host boundaries:** the script refuses Docker installations, listeners on 80/443/3000, active or enabled firewalld/distribution nftables services, and unrecognized nftables tables. It recognizes its own `inet vps_edge` table, Fail2ban's `inet f2b-table`, and inspected UFW compatibility tables during migration. Existing SSH settings that override its policy cause validation to fail.
 
 Use a fresh provider image after a compromise. Reinstallation does not revoke stolen credentials: rotate external tokens, passwords, and keys that the old host could access. This script configures a baseline; it does not clean an infected operating system, configure disk encryption, or prevent an attacker with root access from changing the firewall.
 
@@ -55,7 +55,8 @@ flowchart TD
     B --> C[Review script and run read-only plan]
     C --> D[Update packages]
     D --> E[Back up managed settings and arm rollback timer]
-    E --> F[Stage SSH, nftables, Fail2ban and updates]
+    E --> U[Activate nftables guard, then migrate UFW if installed]
+    U --> F[Stage SSH, Fail2ban and updates]
     F --> G[Open a fresh SSH session and run local verification]
     G --> H[Test real listeners from an external IPv4 and IPv6 network]
     H --> I[Commit from the new SSH session]
@@ -189,6 +190,7 @@ sudo /usr/bin/python3 /root/bootstrap/phase1.py plan --admin ubuntu
 | `--ssh-port 2222` | Stage a migration to port 2222 |
 | `--interface ens3` | Explicitly select one public uplink |
 | Repeated `--interface` | Include each public uplink |
+| `--migrate-ufw` | Replace a reviewed live or custom UFW policy |
 | `--skip-packages` | Skip package operations on an already-patched host with prerequisites installed |
 | `--rollback-minutes 30` | Extend the apply deadline to 30 minutes |
 
@@ -201,6 +203,18 @@ sudo /usr/bin/python3 /root/bootstrap/phase1.py plan --admin ubuntu --interface 
 **Review:** the selected port must be `2222`, the interface must be `ens3`, and the staging ports must include the old port. The script rejects a list that omits a detected uplink.
 
 Changing the SSH port reduces routine scanning noise. Public-key authentication provides the authentication control. Keep port 22 if migration adds no operational benefit.
+
+### UFW on a Fresh Image
+
+A provider image can have `ufw.service` enabled or active while UFW itself reports `Status: inactive`. The script checks both states. `plan` displays the running policy, saved rules, and any detected configuration changes without disabling UFW.
+
+- **Inactive with no detected custom policy:** apply migrates UFW automatically, even when its service is enabled.
+- **Active or containing saved/custom rules:** review the plan, then add `--migrate-ufw` to apply if you intend to replace that policy. This includes policies supplied by the provider.
+- **Unrecognized firewall objects:** reconcile them manually; the migration flag does not override this refusal.
+
+Migration replaces UFW's policy with this guide's SSH-only ingress policy. It does not translate existing service exceptions, source restrictions, routing rules, or outbound restrictions. If replacement is intended, append `--migrate-ufw` to the apply command in step 4. Retain any interface, port, or package options from your reviewed plan. Do not disable UFW manually first.
+
+The script saves `/etc/ufw/` and `/etc/default/ufw`, arms rollback, and activates the persistent nftables guard before disabling UFW. Recovery restores UFW configuration, its runtime policy, and its service state before removing the staged guard. If UFW restoration fails, recovery keeps the staged guard and reports an incomplete rollback for console repair.
 
 ## 4. Apply with Timed Rollback
 
@@ -388,7 +402,7 @@ sudo fail2ban-client set sshd unbanip 192.0.2.123
 
 ### Restore an Uncommitted Run
 
-Rollback restores managed files, the previous live `vps_edge` table, and recorded service states. Installed/upgraded packages remain. From a working session or the provider console:
+Rollback restores managed files, the previous live `vps_edge` table, recorded service states, and UFW when migration began. Installed/upgraded packages remain. From a working session or the provider console:
 
 ```bash
 sudo /usr/bin/python3 /var/lib/vps-phase1/RUN_ID/phase1.py rollback --run-id RUN_ID
@@ -468,7 +482,9 @@ The `inet` family covers both IPv4 and IPv6. Host-only, container-only, internal
 
 Persistence comes from `vps-edge.service`. A Docker systemd drop-in requires it and orders Docker startup after it. The dependency establishes startup ordering; it does not monitor live rules continuously or stop a root user from deleting them. Do not enable a second firewall manager, disable Docker's normal firewall management, or load a configuration that flushes the full ruleset.
 
-References: [Docker packet filtering and UFW behavior](https://docs.docker.com/engine/network/packet-filtering-firewalls/), [Netfilter hook priorities](https://wiki.nftables.org/wiki-nftables/index.php/Netfilter_hooks), [nftables address families](https://wiki.nftables.org/wiki-nftables/index.php/Nftables_families), [systemd dependency semantics](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html).
+UFW migration uses its supported disable/enable commands and preserves its saved configuration for recovery. The migration flag explicitly accepts replacing an existing policy; it does not assert that the image is unmodified.
+
+References: [Ubuntu UFW manual](https://manpages.ubuntu.com/manpages/noble/man8/ufw.8.html), [Docker packet filtering and UFW behavior](https://docs.docker.com/engine/network/packet-filtering-firewalls/), [Netfilter hook priorities](https://wiki.nftables.org/wiki-nftables/index.php/Netfilter_hooks), [nftables address families](https://wiki.nftables.org/wiki-nftables/index.php/Nftables_families), [systemd dependency semantics](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html).
 
 ### Fail2ban
 
@@ -480,7 +496,7 @@ References: [Fail2ban jail configuration](https://github.com/fail2ban/fail2ban/b
 
 Package updates precede managed SSH changes so the procedure uses the updated OpenSSH package. APT periodic configuration and systemd timers schedule unattended Ubuntu updates. Review actual update origins and logs; a scheduled timer alone cannot prove that every package was patched.
 
-Backups cover the seven managed paths below. The script changes their contents atomically, saves prior service states and live guard rules, and arms a persistent calendar timer before applying network changes. A fresh session and an operator assertion of external tests are required before it disarms recovery.
+Backups cover the seven managed paths below and, when UFW is installed, its configuration files and service/runtime state. The script changes their contents atomically, saves prior service states and live guard rules, and arms a persistent calendar timer before applying network changes. A fresh session and an operator assertion of external tests are required before it disarms recovery.
 
 | Managed Path | Purpose |
 | --- | --- |
@@ -524,6 +540,7 @@ Before releasing a version for production use, test it on a disposable Ubuntu 24
 - **SSH modes:** test the image's default socket activation and service-based activation.
 - **Port choices:** test retaining the existing port and migrating to another port.
 - **Network families:** test IPv4 and IPv6 listeners from outside the VPS, before and after reboot.
+- **UFW migration:** test an inactive but enabled installation, an active SSH-only policy, and custom saved rules. Confirm explicit migration is required for live/custom policies, SSH works afterward, and rollback restores the prior policy and boot state.
 - **Recovery:** deliberately leave a staged run uncommitted and verify automatic restoration after its deadline. Also test manual rollback and recovery after disconnecting the staging session.
 - **Failures:** confirm an old SSH session cannot commit and an overridden SSH directive causes safe failure.
 - **Docker handoff:** after committing, install Docker on the disposable host, publish a harmless container on port 3000, and prove it works locally while remaining blocked externally. Confirm Docker starts after the guard on reboot.

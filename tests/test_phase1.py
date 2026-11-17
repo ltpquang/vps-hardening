@@ -5,6 +5,7 @@ import copy
 import importlib.util
 import io
 import json
+import hashlib
 import os
 from pathlib import Path
 import stat
@@ -231,6 +232,19 @@ class FileAndTransactionTests(unittest.TestCase):
         self.assertEqual(state['status'], 'rollback_failed')
         self.disarm.assert_not_called()
 
+    def test_failed_ufw_restore_keeps_staged_guard(self):
+        folder, state = self.transaction()
+        state['previous_rules'] = 'table inet vps_edge { chain old { } }'
+        state['units']['vps-edge.service']['active'] = True
+        with patch.object(p, 'restore_ufw', side_effect=p.Error('cannot restore UFW')):
+            with self.assertRaisesRegex(p.Error, 'keeping the staged ingress guard'):
+                p.rollback(folder, state)
+        self.assertFalse(any(args == ('nft', '-f', '-') or args[:3] == ('nft', 'delete', 'table')
+                             for args, kwargs in self.commands))
+        self.assertNotIn((('systemctl', 'restart', 'vps-edge.service'), {}), self.commands)
+        self.assertEqual(state['status'], 'rollback_failed')
+        self.disarm.assert_not_called()
+
     def test_symlink_write_rejected_without_touching_target(self):
         target = self.root / 'target'; target.write_text('keep')
         link = self.root / 'link'; link.symlink_to(target)
@@ -349,6 +363,160 @@ class FileAndTransactionTests(unittest.TestCase):
             p.commit(argparse.Namespace(external_checks_passed=True), folder, state)
         self.assertEqual(state['status'], 'rolled_back')
         self.assertEqual(Path(self.names[0]).read_text(), 'original SSH settings\n')
+
+
+class UfwMigrationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.ufw = self.root / 'etc/ufw'
+        self.ufw.mkdir(parents=True)
+        self.defaults = self.root / 'etc/default/ufw'
+        self.defaults.parent.mkdir()
+        self.defaults.write_text('DEFAULT_INPUT_POLICY="DROP"\n')
+        self.before = self.ufw / 'before.rules'
+        self.before.write_text('*filter\nCOMMIT\n')
+        self.conffiles = '\n'.join(f' {path} {hashlib.md5(path.read_bytes()).hexdigest()}'
+                                   for path in (self.defaults, self.before))
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(p, 'UFW_ROOT', self.ufw))
+        self.stack.enter_context(patch.object(p, 'UFW_DEFAULT', self.defaults))
+        self.stack.enter_context(patch.object(p, 'STATE', self.root / 'state'))
+
+    def inspect(self, status='Status: inactive', added='Added user rules:'):
+        def fake_run(*args, **kwargs):
+            if args[0] == 'dpkg-query':
+                return self.conffiles
+            return added if args[1:3] == ('show', 'added') else status
+        with patch.object(p, 'active', return_value=True), \
+             patch.object(p, 'enabled', return_value=True), \
+             patch.object(p.shutil, 'which', return_value='/mock/ufw'), \
+             patch.object(p, 'run', side_effect=fake_run):
+            return p.inspect_ufw()
+
+    def test_enabled_service_with_unused_stock_configuration_needs_no_flag(self):
+        info = self.inspect()
+        self.assertTrue(info['unit']['active'])
+        self.assertFalse(info['running'])
+        self.assertFalse(info['requires_confirmation'])
+
+    def test_live_policy_requires_explicit_migration(self):
+        self.assertTrue(self.inspect(status='Status: active')['requires_confirmation'])
+
+    def test_saved_rules_require_review_even_if_ufw_is_inactive(self):
+        self.assertTrue(self.inspect(added='Added user rules:\nufw allow 443/tcp')['requires_confirmation'])
+
+    def test_hand_edited_user_rules_without_metadata_require_review(self):
+        (self.ufw / 'user.rules').write_text('-A ufw-user-input -p tcp --dport 443 -j ACCEPT\n')
+        self.assertTrue(self.inspect()['requires_confirmation'])
+
+    def test_changed_before_rules_require_review(self):
+        self.before.write_text('custom policy')
+        self.assertTrue(self.inspect()['requires_confirmation'])
+
+    def test_unknown_runtime_status_is_rejected(self):
+        with self.assertRaisesRegex(p.Error, 'runtime state'):
+            self.inspect(status='unrecognized')
+
+    def test_ufw_table_does_not_exempt_unrelated_chains(self):
+        raw = json.dumps({'nftables': [{'chain': {'name': 'custom'}}]})
+        with patch.object(p, 'run', return_value=raw), self.assertRaisesRegex(p.Error, 'Unrecognized chain'):
+            p.check_ufw_table('ip')
+
+    def test_ufw_table_does_not_exempt_unrelated_builtin_rules(self):
+        raw = json.dumps({'nftables': [{'rule': {'chain': 'INPUT', 'expr': [{'accept': None}]}}]})
+        with patch.object(p, 'run', return_value=raw), self.assertRaisesRegex(p.Error, 'Non-UFW'):
+            p.check_ufw_table('ip')
+
+    def test_ufw_compatibility_table_is_recognized(self):
+        raw = json.dumps({'nftables': [
+            {'chain': {'name': 'INPUT'}}, {'chain': {'name': 'ufw-before-input'}},
+            {'rule': {'chain': 'INPUT', 'expr': [{'counter': {}}, {'jump': {'target': 'ufw-before-input'}}]}},
+        ]})
+        with patch.object(p, 'run', return_value=raw):
+            p.check_ufw_table('ip')
+
+    def test_ipv6_ufw_compatibility_table_is_recognized(self):
+        raw = json.dumps({'nftables': [
+            {'chain': {'name': 'INPUT'}}, {'chain': {'name': 'ufw6-before-input'}},
+            {'rule': {'chain': 'INPUT', 'expr': [{'jump': {'target': 'ufw6-before-input'}}]}},
+        ]})
+        with patch.object(p, 'run', return_value=raw):
+            p.check_ufw_table('ip6')
+
+    def test_inactive_runtime_is_restored_even_if_service_was_active(self):
+        info = self.inspect()
+        folder = self.root / 'backup'
+        folder.mkdir()
+        p.backup_ufw(folder, info)
+        info['migration_started'] = True
+        calls = []
+        with patch.object(p, 'run', side_effect=lambda *a, **kw: calls.append(a) or 'Status: inactive'):
+            p.restore_ufw(folder, {'ufw': info})
+        self.assertIn(('systemctl', 'start', 'ufw.service'), calls)
+        self.assertIn(('ufw', '--force', 'disable'), calls)
+        self.assertNotIn(('ufw', '--force', 'enable'), calls)
+
+    def test_guard_is_required_before_any_ufw_mutation(self):
+        with patch.object(p, 'active', return_value=False), patch.object(p, 'run') as run:
+            with self.assertRaisesRegex(p.Error, 'guard must be active'):
+                p.migrate_ufw({'ufw': self.inspect()})
+        run.assert_not_called()
+
+    def test_activation_disables_ufw_after_guard_and_before_ssh_reload(self):
+        info = self.inspect()
+        calls = []
+        def fake_run(*args, **kwargs):
+            calls.append(args)
+            return 'Status: inactive' if args[:2] == ('ufw', 'status') else 'guard'
+        with patch.object(p, 'run', side_effect=fake_run), \
+             patch.object(p, 'active', side_effect=lambda unit: unit == 'vps-edge.service'), \
+             patch.object(p, 'enabled', side_effect=lambda unit: unit == 'vps-edge.service'), \
+             patch.object(p, 'save_state'), patch.object(p, 'wait_for_fail2ban'), \
+             patch.object(p, 'reload_ssh', side_effect=lambda state: calls.append(('ssh-reload',))), \
+             contextlib.redirect_stdout(io.StringIO()):
+            p.activate({'id': 'test-run', 'ufw': info})
+        guard = calls.index(('systemctl', 'enable', '--now', 'vps-edge.service'))
+        disable = calls.index(('ufw', '--force', 'disable'))
+        ssh = calls.index(('ssh-reload',))
+        self.assertLess(guard, disable)
+        self.assertLess(disable, ssh)
+        self.assertTrue(info['migration_started'])
+        self.assertTrue(info['migrated'])
+
+    def test_ufw_backup_restores_configuration_and_runtime_separately_from_unit(self):
+        info = self.inspect(status='Status: active')
+        folder = self.root / 'backup'
+        folder.mkdir()
+        original = self.before.read_text()
+        p.backup_ufw(folder, info)
+        self.before.write_text('changed')
+        info['migration_started'] = True
+        calls = []
+        def fake_run(*args, **kwargs):
+            calls.append(args)
+            if args == ('ufw', '--force', 'enable'):
+                self.assertEqual(self.before.read_text(), original)
+            return 'Status: active'
+        with patch.object(p, 'run', side_effect=fake_run):
+            p.restore_ufw(folder, {'ufw': info})
+        self.assertEqual(self.before.read_text(), original)
+        self.assertIn(('ufw', '--force', 'enable'), calls)
+        self.assertIn(('systemctl', 'enable', 'ufw.service'), calls)
+
+    def test_missing_migration_flag_stops_apply_before_packages_or_backups(self):
+        state = {'ufw': self.inspect(status='Status: active')}
+        with patch.object(p, 'pending_runs', return_value=[]), \
+             patch.object(p, 'active', return_value=False), \
+             patch.object(p, 'preflight', return_value=state), \
+             patch.object(p.subprocess, 'run') as packages, patch.object(p, 'make_run') as backup, \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(p.Error, '--migrate-ufw'):
+                p.apply(argparse.Namespace(migrate_ufw=False))
+        packages.assert_not_called()
+        backup.assert_not_called()
 
 
 class AuditTests(unittest.TestCase):

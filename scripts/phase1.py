@@ -29,6 +29,8 @@ import time
 
 STATE = Path('/var/lib/vps-phase1')
 TIMER = 'vps-phase1-rollback'
+UFW_ROOT = Path('/etc/ufw')
+UFW_DEFAULT = Path('/etc/default/ufw')
 PATHS = (
     '/etc/ssh/sshd_config.d/00-local-security.conf',
     '/etc/ssh/sshd_config.d/00-local-ports.conf',
@@ -56,7 +58,8 @@ class Error(RuntimeError):
 
 def run(*args: str, check=True, data=None) -> str:
     try:
-        proc = subprocess.run(args, input=data, text=True, capture_output=True, timeout=90)
+        proc = subprocess.run(args, input=data, text=True, capture_output=True, timeout=90,
+                              env=dict(os.environ, LC_ALL='C'))
     except subprocess.TimeoutExpired:
         raise Error(f'{shlex.join(args)} timed out.') from None
     if check and proc.returncode:
@@ -295,15 +298,75 @@ def unit_states() -> dict:
             for u in ('vps-edge.service', 'fail2ban.service', 'apt-daily.timer', 'apt-daily-upgrade.timer')}
 
 
-def safety_checks():
+def inspect_ufw() -> dict | None:
+    unit = {'active': active('ufw.service'), 'enabled': enabled('ufw.service')}
+    if not shutil.which('ufw'):
+        if any(unit.values()):
+            raise Error('ufw.service exists but the ufw command is unavailable; inspect it manually.')
+        return None
+    status = run('ufw', 'status', 'verbose')
+    if not status.startswith(('Status: active', 'Status: inactive')):
+        raise Error('Cannot determine UFW runtime state.')
+    added = run('ufw', 'show', 'added')
+    reasons = []
+    running = status.startswith('Status: active')
+    if running:
+        reasons.append('UFW is enforcing a live policy')
+    if any(line.strip().startswith('ufw ') for line in added.splitlines()):
+        reasons.append('UFW has saved user rules')
+    # Do not trust only the summary: hand-edited rules may lack UFW metadata.
+    for name in ('user.rules', 'user6.rules'):
+        path = UFW_ROOT / name
+        if path.exists() and any(line.strip().startswith(('-A ', '-I ')) and
+                                 not line.strip().startswith(('-A ufw-user-limit', '-A ufw6-user-limit'))
+                                 for line in path.read_text().splitlines()):
+            reasons.append(f'{name} contains saved filtering rules')
+    # Custom before/after rules or defaults must not be silently discarded.
+    conffiles = run('dpkg-query', '-W', '-f=${Conffiles}', 'ufw')
+    hashes = dict(re.findall(r'^\s*(/\S+)\s+([a-f0-9]{32})(?:\s+obsolete)?\s*$', conffiles, re.M))
+    for path in (UFW_DEFAULT, *(UFW_ROOT / n for n in
+                  ('before.rules', 'before6.rules', 'after.rules', 'after6.rules',
+                   'before.init', 'after.init', 'sysctl.conf'))):
+        if path.exists() and (path.is_symlink() or hashes.get(str(path)) !=
+                              hashlib.md5(path.read_bytes(), usedforsecurity=False).hexdigest()):
+            reasons.append(f'{path} differs from the packaged configuration')
+    return {'running': running, 'unit': unit, 'status': status, 'added_rules': added,
+            'review_reasons': reasons, 'requires_confirmation': bool(reasons)}
+
+
+def check_ufw_table(family: str):
+    """Permit UFW compatibility tables without adopting unrelated native chains."""
+    items = json.loads(run('nft', '-j', 'list', 'table', family, 'filter'))['nftables']
+    for item in items:
+        if 'chain' in item:
+            name = item['chain']['name']
+            if name not in {'INPUT', 'FORWARD', 'OUTPUT'} and not name.startswith(('ufw-', 'ufw6-')):
+                raise Error(f'Unrecognized chain in {family} filter: {name}')
+        if 'rule' in item and not item['rule']['chain'].startswith(('ufw-', 'ufw6-')):
+            expressions = item['rule']['expr']
+            if not any(e.get('jump', {}).get('target', '').startswith(('ufw-', 'ufw6-')) for e in expressions) or any(
+                    set(e) - {'counter', 'jump'} for e in expressions):
+                raise Error(f'Non-UFW rule in {family} filter; reconcile it manually.')
+        if set(item) - {'metainfo', 'table', 'chain', 'rule'}:
+            raise Error(f'Unsupported objects in {family} filter; reconcile them manually.')
+
+
+def safety_checks(ufw=None):
     if shutil.which('docker') or Path('/usr/bin/dockerd').exists():
         raise Error('Docker is already installed. Phase 1 apply is for pre-Docker hosts only.')
     for unit in ('ufw.service', 'firewalld.service', 'nftables.service'):
+        if unit == 'ufw.service' and ufw is not None:
+            continue
         if active(unit) or enabled(unit):
             raise Error(f'{unit} is active or enabled. Reconcile the existing firewall manually first.')
     if shutil.which('nft'):
         tables = parse_tables(run('nft', 'list', 'tables'))
         unknown = tables - {('inet', 'vps_edge'), ('inet', 'f2b-table')}
+        if ufw is not None:
+            for family, table in list(unknown):
+                if family in {'ip', 'ip6'} and table == 'filter':
+                    check_ufw_table(family)
+                    unknown.remove((family, table))
         if unknown:
             raise Error(f'Unrecognized firewall tables: {sorted(unknown)}. Refusing to replace policy.')
 
@@ -371,10 +434,11 @@ def preflight(args) -> dict:
     routes = json.loads(run('ip', '-j', '-4', 'route', 'show', 'default'))
     routes += json.loads(run('ip', '-j', '-6', 'route', 'show', 'default'))
     interfaces = choose_interfaces(addresses, routes, args.interface)
-    safety_checks()
+    ufw = inspect_ufw()
+    safety_checks(ufw)
     return {'admin': args.admin, 'port': target, 'previous_ports': ports,
             'stage_ports': sorted(set(ports + [target])), 'interfaces': interfaces,
-            'socket': active('ssh.socket'), 'client': info['client'] if info else None}
+            'socket': active('ssh.socket'), 'client': info['client'] if info else None, 'ufw': ufw}
 
 
 def plan(args):
@@ -388,6 +452,78 @@ def plan(args):
     print('\nApply will back up these files and stage a timed rollback before network changes.')
     print('Manual: provider-account MFA/recovery, verified sudo/key access, external IPv4/IPv6 tests, reboot.')
     print('No provider network firewall is required. The host guard enforces the ingress policy.')
+    if state.get('ufw'):
+        if state['ufw']['requires_confirmation']:
+            print('UFW REVIEW: inspect the policy above. Apply requires --migrate-ufw to replace it.')
+        else:
+            print('UFW: inactive with no detected custom policy; apply will migrate it automatically.')
+        print('UFW is disabled only after the guard is active; rollback restores its saved configuration/state.')
+
+
+def backup_ufw(folder: Path, info: dict):
+    if UFW_ROOT.is_symlink():
+        raise Error(f'Refusing UFW configuration symlink: {UFW_ROOT}')
+    paths = sorted(UFW_ROOT.rglob('*')) if UFW_ROOT.exists() else []
+    paths.append(UFW_DEFAULT)
+    snapshots = {}
+    for path in paths:
+        if path.is_symlink():
+            raise Error(f'Refusing UFW configuration symlink: {path}')
+        if not path.exists() or path.is_dir():
+            continue
+        if not path.is_file():
+            raise Error(f'Unsupported UFW configuration: {path}')
+        original = path.stat()
+        name = f'ufw-file-{len(snapshots)}'
+        write(folder / name, path.read_bytes(), 0o600)
+        snapshots[str(path)] = {'backup': name, 'mode': stat.S_IMODE(original.st_mode),
+                                'uid': original.st_uid, 'gid': original.st_gid}
+    info['files'] = snapshots
+
+
+def restore_ufw(folder: Path, state: dict):
+    info = state.get('ufw')
+    if not info or not info.get('migration_started'):
+        return
+    def restore_files():
+        for name, metadata in info['files'].items():
+            path = Path(name)
+            source = folder / metadata['backup']
+            if source.parent != folder or '..' in path.parts or not (
+                    path.is_relative_to(UFW_ROOT) or path == UFW_DEFAULT):
+                raise Error('Invalid UFW backup path.')
+            write(path, source.read_bytes(), metadata['mode'])
+            os.chown(path, metadata['uid'], metadata['gid'])
+    restore_files()
+    run('systemctl', 'enable' if info['unit']['enabled'] else 'disable', 'ufw.service')
+    run('systemctl', 'start' if info['unit']['active'] else 'stop', 'ufw.service')
+    # A systemd active(exited) unit does not establish whether rules are loaded.
+    run('ufw', '--force', 'enable' if info['running'] else 'disable')
+    restore_files()
+    live = run('ufw', 'status').startswith('Status: active')
+    if live != info['running']:
+        raise Error('UFW runtime state could not be restored.')
+
+
+def migrate_ufw(state: dict):
+    info = state.get('ufw')
+    if not info or info.get('migrated'):
+        return
+    if not active('vps-edge.service') or not enabled('vps-edge.service'):
+        raise Error('The persistent guard must be active before UFW migration.')
+    guard = normalize_rules(run('nft', 'list', 'table', 'inet', 'vps_edge'))
+    # Persist intent before the first UFW mutation, including interruption recovery.
+    info['migration_started'] = True
+    save_state(STATE / state['id'], state)
+    run('ufw', '--force', 'disable')
+    run('systemctl', 'disable', '--now', 'ufw.service')
+    if not run('ufw', 'status').startswith('Status: inactive') or enabled('ufw.service') or active('ufw.service'):
+        raise Error('UFW did not become inactive and disabled.')
+    if normalize_rules(run('nft', 'list', 'table', 'inet', 'vps_edge')) != guard:
+        raise Error('UFW migration changed the ingress guard; rolling back.')
+    info['migrated'] = True
+    save_state(STATE / state['id'], state)
+    print('PASS: UFW migrated after the persistent ingress guard became active.')
 
 
 def make_run(state: dict) -> tuple[Path, dict]:
@@ -413,6 +549,8 @@ def make_run(state: dict) -> tuple[Path, dict]:
         else:
             snapshots[name] = None
     state['files'] = snapshots
+    if state.get('ufw'):
+        backup_ufw(folder, state['ufw'])
     write(folder / 'baseline.txt',
           'Enabled services before script configuration:\n' +
           run('systemctl', 'list-unit-files', '--type=service', '--state=enabled', '--no-pager') +
@@ -521,6 +659,7 @@ def activate(state: dict):
     # Apply directly as an already-active oneshot will not rerun on start.
     run('nft', '-f', '/etc/vps-edge.nft')
     run('systemctl', 'enable', '--now', 'vps-edge.service')
+    migrate_ufw(state)
     reload_ssh(state)
     run('systemctl', 'enable', 'fail2ban.service')
     run('systemctl', 'restart', 'fail2ban.service')
@@ -553,6 +692,11 @@ def audit(state: dict, ports: list[int]) -> list[str]:
         routes += json.loads(run('ip', '-j', '-6', 'route', 'show', 'default'))
         choose_interfaces(addresses, routes, state['interfaces'])
     check('Public interfaces', uplinks)
+    if state.get('ufw'):
+        def ufw_disabled():
+            if active('ufw.service') or enabled('ufw.service') or not run('ufw', 'status').startswith('Status: inactive'):
+                raise Error('UFW must remain inactive and disabled after migration.')
+        check('UFW migration', ufw_disabled)
     for name, expected in state.get('hashes', {}).items():
         if not Path(name).is_file() or hashlib.sha256(Path(name).read_bytes()).hexdigest() != expected:
             issues.append(f'Managed file changed: {name}')
@@ -621,7 +765,15 @@ def rollback(folder: Path, state: dict):
             operation()
         except Error as exc:
             errors.append(f'{label}: {exc}')
+    ufw_restored = True
+    try:
+        restore_ufw(folder, state)
+    except (Error, OSError) as exc:
+        ufw_restored = False
+        errors.append(f'UFW restore: {exc}; keeping the staged ingress guard for protection.')
     for unit, original in state['units'].items():
+        if unit == 'vps-edge.service' and not ufw_restored:
+            continue
         try:
             run('systemctl', 'enable' if original['enabled'] else 'disable', unit, check=False)
             if original['active']:
@@ -632,7 +784,9 @@ def rollback(folder: Path, state: dict):
             errors.append(f'{unit}: {exc}')
     try:
         # The previous live table can differ from its persistent file.
-        if state['previous_rules']:
+        if not ufw_restored:
+            pass
+        elif state['previous_rules']:
             run('nft', '-f', '-', data='add table inet vps_edge\nflush table inet vps_edge\n' + state['previous_rules'] + '\n')
         elif ('inet', 'vps_edge') in parse_tables(run('nft', 'list', 'tables')):
             run('nft', 'delete', 'table', 'inet', 'vps_edge')
@@ -653,6 +807,10 @@ def apply(args):
         raise Error('An existing rollback timer is active; investigate before another run.')
     state = preflight(args)
     print('Preflight passed:', json.dumps(state), flush=True)
+    def require_migration_confirmation():
+        if (state.get('ufw') or {}).get('requires_confirmation') and not getattr(args, 'migrate_ufw', False):
+            raise Error('UFW has a live or custom policy. Review plan, then use --migrate-ufw to replace it.')
+    require_migration_confirmation()
     if not args.skip_packages:
         env = dict(os.environ, DEBIAN_FRONTEND='noninteractive', NEEDRESTART_MODE='l')
         for command in (
@@ -666,9 +824,9 @@ def apply(args):
     for command in ('nft', 'fail2ban-client', 'unattended-upgrade'):
         if not shutil.which(command):
             raise Error(f'Missing {command}; install prerequisites or omit --skip-packages.')
-    safety_checks()
     # Recheck configuration after upgrades before creating the rollback baseline.
     state = preflight(args)
+    require_migration_confirmation()
     folder, state = make_run(state)
     state['deadline'] = time.time() + args.rollback_minutes * 60
     save_state(folder, state)
@@ -742,6 +900,7 @@ def parser():
         p.add_argument('--ssh-port', type=int, help='Keep current port by default; e.g. 2222 to migrate')
         p.add_argument('--interface', action='append', default=[], help='Repeat for each public uplink; otherwise detected')
         p.add_argument('--skip-packages', action='store_true', help='For already-patched hosts with all prerequisites installed')
+        p.add_argument('--migrate-ufw', action='store_true', help='Replace reviewed live/custom UFW policy with the SSH-only guard')
         if mode == 'apply':
             p.add_argument('--rollback-minutes', type=int, default=20, choices=range(5, 121), metavar='5..120')
     for mode in ('verify', 'commit', 'rollback'):

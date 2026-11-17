@@ -6,7 +6,7 @@ This repository automates first-time hardening of a fresh Ubuntu 24.04 VPS befor
 
 - Keep `plan` and `verify` free of configuration changes.
 - Preserve staged SSH migration, a persistent rollback deadline, and the fresh-session commit requirement.
-- Own only the documented configuration files and `inet vps_edge` table. Never flush the whole nftables ruleset.
+- Own only the documented configuration files and `inet vps_edge` table. UFW migration may disable UFW after backing up its configuration and activating the guard; rollback must restore UFW before removing the guard. Never flush the whole nftables ruleset.
 - Preserve IPv4 and IPv6 coverage and Docker's normal firewall management.
 - Do not execute apply, commit, rollback, package operations, or host service changes in a development environment. Use mocked tests or a deliberately provisioned disposable VM.
 - Run `python3 -m unittest discover -s tests -v` and `python3 -m py_compile scripts/phase1.py tests/test_phase1.py` after code changes.
