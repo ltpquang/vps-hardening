@@ -67,6 +67,8 @@ flowchart TD
 
 The default rollback deadline is **20 minutes after package operations finish**, before configuration staging begins. The timer survives an accidental reboot and attempts recovery if its deadline passed while the VPS was offline. Keep the VPS running until commit succeeds.
 
+Script commands report their results. The steps below identify the success marker and the next action. If a command reports `FAIL` or `ERROR`, resolve the reported problem or follow [Recovery](#recovery) before continuing. Expected outcomes remain explicit for manual checks that the script cannot perform.
+
 **Package installation and upgrades are outside rollback.** Backups capture the configuration after package operations. Maintainer scripts may change services during upgrades, and the script cannot reverse those effects. The recovery console remains necessary even with automatic rollback.
 
 ## 1. Prepare Recovery and Key Access
@@ -179,7 +181,7 @@ The script discovers default-route interfaces and interfaces with global address
 sudo /usr/bin/python3 /root/bootstrap/phase1.py plan --admin ubuntu
 ```
 
-**Expected:** JSON containing `admin`, selected `port`, `previous_ports`, `stage_ports`, `interfaces`, and the SSH socket-activation mode. The remaining output previews packages and managed file contents. `PLAN ONLY` confirms that the script made no configuration changes. Errors stop the preview and identify the failed prerequisite.
+**Success:** `PLAN ONLY` confirms a read-only preview. Review the administrator, interfaces, SSH ports, and proposed changes before applying.
 
 | Option | Use |
 | --- | --- |
@@ -196,7 +198,7 @@ For example, a migration on an `ens3` host is previewed with:
 sudo /usr/bin/python3 /root/bootstrap/phase1.py plan --admin ubuntu --interface ens3 --ssh-port 2222
 ```
 
-**Expected:** `port` is `2222`, `interfaces` contains `ens3`, and `stage_ports` includes both the old port and `2222`. An explicit interface list that omits a detected uplink is rejected.
+**Review:** the selected port must be `2222`, the interface must be `ens3`, and the staging ports must include the old port. The script rejects a list that omits a detected uplink.
 
 Changing the SSH port reduces routine scanning noise. Public-key authentication provides the authentication control. Keep port 22 if migration adds no operational benefit.
 
@@ -208,13 +210,7 @@ Use the same administrator, interface, port, and package options that you review
 sudo /usr/bin/python3 /root/bootstrap/phase1.py apply --admin ubuntu
 ```
 
-**Expected:**
-
-- Preflight passes before package operations begin.
-- APT updates package lists, upgrades packages while preserving existing configuration files, and installs prerequisites.
-- The script saves backups and arms the rollback timer before changing managed network configuration.
-- Validation checks pass and the script prints `STAGED RUN: RUN_ID`, a UTC deadline, a backup directory, and fresh-login/commit commands.
-- Both old and selected SSH ports remain permitted during staging.
+**Success:** `STAGED RUN: RUN_ID` appears with a rollback deadline, backup directory, and next commands. Configuration awaits confirmation; both old and selected SSH ports remain permitted. Continue with a new SSH session before the deadline.
 
 If using the migration preview above, add `--interface ens3 --ssh-port 2222` to apply as well. `--rollback-minutes` accepts 5 through 120 minutes. Allow enough time for the external checks.
 
@@ -239,7 +235,7 @@ sudo -v
 sudo /usr/bin/python3 /var/lib/vps-phase1/RUN_ID/phase1.py verify --run-id RUN_ID
 ```
 
-**Expected:** sudo succeeds; verification prints `state: awaiting_commit` and `PASS` lines for effective SSH policy, listeners, detected uplinks, managed files, live firewall rules, Fail2ban, and APT timers. A `FAIL` or `ERROR` returns a nonzero exit status. Resolve it or roll back before continuing.
+**Success:** sudo succeeds; verification reports `state: awaiting_commit` and all checks pass. Continue with the external listener tests.
 
 Verify the rollback deadline is scheduled:
 
@@ -326,7 +322,7 @@ After the new key login, sudo, local audit, and applicable external tests pass, 
 sudo /usr/bin/python3 /var/lib/vps-phase1/RUN_ID/phase1.py commit --run-id RUN_ID --external-checks-passed
 ```
 
-**Expected:** `COMMITTED RUN_ID` with the final SSH port. Commit removes obsolete SSH ports from managed configuration, rechecks the final state, and disables the rollback timer. The external-checks flag records your assertion; it does not run a remote scan.
+**Success:** `COMMITTED RUN_ID` confirms the final SSH port and disables automatic rollback. Open another fresh connection before rebooting. The external-checks flag records your assertion; it does not run a remote scan.
 
 Commit rejects an old SSH session, the wrong administrator or port, an expired deadline, and detected configuration drift. A failed final activation attempts rollback. Do not bypass the new-session requirement through the console.
 
@@ -346,7 +342,7 @@ sudo /usr/bin/python3 /var/lib/vps-phase1/RUN_ID/phase1.py verify --run-id RUN_I
 sudo ss -lntup
 ```
 
-**Expected:** sudo succeeds, verify reports `state: committed` with all checks passing, and `ss` lists the actual TCP/UDP listeners and processes. Review unexplained listeners even when the firewall blocks them. Repeat the external listener tests after reboot to check persistence.
+**Check:** sudo succeeds and verification reports `state: committed` with all checks passing. Review the listeners and processes listed by `ss`, investigating unexplained services even when the firewall blocks them. Repeat the external listener tests after reboot to check persistence.
 
 ### Check Security Updates
 
@@ -392,13 +388,13 @@ sudo fail2ban-client set sshd unbanip 192.0.2.123
 
 ### Restore an Uncommitted Run
 
-From a working session or the provider console:
+Rollback restores managed files, the previous live `vps_edge` table, and recorded service states. Installed/upgraded packages remain. From a working session or the provider console:
 
 ```bash
 sudo /usr/bin/python3 /var/lib/vps-phase1/RUN_ID/phase1.py rollback --run-id RUN_ID
 ```
 
-**Expected:** `ROLLED BACK RUN_ID`. The script restores managed files, the previous live `vps_edge` table, and recorded service states. Installed/upgraded packages remain. An already committed or rolled-back run is a no-op, so an old timer cannot undo a committed configuration.
+**Success:** `ROLLED BACK RUN_ID`. Test a fresh SSH connection before continuing. An already committed or rolled-back run is a no-op, so an old timer cannot undo a committed configuration.
 
 If rollback is incomplete:
 
