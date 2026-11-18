@@ -8,7 +8,7 @@ This repository automates first-time hardening of a fresh Ubuntu 24.04 VPS befor
 - [scripts/phase1.py](scripts/phase1.py) implements `plan`, `apply`, `verify`, `commit`, and `rollback`. It configures SSH, the IPv4 and IPv6 ingress guard, Fail2ban, and automatic security updates.
 - [tests/test_phase1.py](tests/test_phase1.py) covers script behavior with mocked system commands. [GitHub Actions](.github/workflows/checks.yml) runs the offline checks on Ubuntu 24.04.
 
-Use [$vps-hardening-validation](.agents/skills/vps-hardening-validation/SKILL.md) to collect the operator's inputs and run the requested Phase 1 command on a VPS.
+Use [$vps-hardening-validation](.agents/skills/vps-hardening-validation/SKILL.md) to guide the operator through running the Phase 1 script.
 
 ## Implementation
 
