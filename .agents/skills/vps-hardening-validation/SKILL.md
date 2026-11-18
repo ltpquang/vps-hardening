@@ -1,56 +1,32 @@
 ---
 name: vps-hardening-validation
-description: Collect operator inputs and run the repository's Phase 1 VPS hardening script. Use for a setup preview, staged apply, verification, commit, or rollback on Ubuntu 24.04.
+description: Walk a VPS operator through using scripts/phase1.py to preview, apply, verify, commit, or roll back hardening on Ubuntu 24.04.
 ---
 
-# Run Phase 1
+# Walk Through Phase 1
 
-Use [README.md](../../../README.md) for the supported procedure. Run the requested `phase1.py` command on the VPS and use its output to decide what information or action is needed next.
+Start with a short overview of the requested steps. For a new setup, say that the operator will prepare SSH access, preview the changes, stage them with automatic rollback, verify from a fresh login, and commit. Start at the relevant step if they already have a plan or staged run.
 
-## Explain the Plan First
+Guide the operator in chat. The operator runs the commands in their terminal. Give one copy-paste command at a time, say where to run it, and explain what success looks like. Wait for the result before giving the next command. Fill in values already known and ask for missing details only when needed. Use ordinary SSH commands for routine access and add options only for a custom port, a non-default identity, or a specific check. Keep passwords and private-key passphrases in the operator's terminal.
 
-Before collecting inputs or connecting, give the operator a short overview of the requested work. For a new setup, show the order: collect access details and choose the SSH port, run `plan`, prove the operator's SSH and sudo access, stage with automatic rollback, verify the new login and external ingress, then commit. Identify which steps the agent runs and which require the operator. For a preview or an existing run, point out where the request ends or resumes. Ask for the first missing input after giving the overview.
+1. **Prepare SSH access.** Make sure the operator can access the provider console and sign in with their own key as a non-root administrator with sudo. The same public key must be installed for root and the administrator. Walk through [key setup](../../../README.md#provision-and-test-a-key) if needed. If SSH shows an unfamiliar host key, have the operator check its fingerprint in the provider console with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` and compare it with the prompt before accepting it. Use the actual host key type if SSH shows a different one.
+2. **Copy and preview the script.** Help the operator [review and copy the script](../../../README.md#2-review-and-copy-the-script) if needed. Ask whether to keep the current SSH port or use a custom port. For the operator key fingerprint, have them run `ssh-keygen -lf ~/.ssh/id_ed25519.pub` on their computer, using their actual public key path. On the VPS, give the command below with their values. Add `--ssh-port PORT` only if they chose a new port. Review the `PLAN ONLY` output with them and resolve any failures before continuing.
 
-## Ask for Missing Inputs
+   ```bash
+   sudo /usr/bin/python3 /root/bootstrap/phase1.py plan --admin ADMIN --operator-key-fingerprint SHA256:FINGERPRINT
+   ```
 
-Reuse values and approvals already given. Ask only for inputs needed for the requested command.
+3. **Stage the changes.** Once the operator has successfully tested a fresh key-only administrator login and `sudo -v` on the current port, give the same command with `apply` in place of `plan` and the same options. Ask for the staged run ID and rollback deadline from the output. Have the operator keep their current SSH session open.
+4. **Verify from a fresh login.** Have the operator open a new SSH connection with their own key on the selected port and run `sudo -v`. If their SSH client reuses connections, add `-S none`. In that new session, use the saved script below. After `verify` passes, guide the operator through the applicable [public port tests](../../../README.md#6-test-public-port-blocking) from outside the VPS.
 
-- For a new setup, get the VPS address, current SSH user and port, trusted host-key fingerprint, and administrator username. Ask whether to keep the current SSH port or use a custom one if the operator has not chosen. Use the script defaults for other options unless the operator specifies them or `plan` shows a decision is needed.
-- Get the operator's public key or its SHA256 fingerprint for `plan` and `apply`. If the operator needs to generate or install a key, guide them through [key setup](../../../README.md#provision-and-test-a-key). Keep the private key on the operator's client.
-- For `verify`, `commit`, or `rollback`, reuse the run ID and saved runner path from `apply`. Ask for the run ID if it is missing.
+   ```bash
+   sudo /usr/bin/python3 /var/lib/vps-phase1/RUN_ID/phase1.py verify --run-id RUN_ID
+   ```
 
-### Give the Operator One-Line Commands
+5. **Commit.** Once the checks pass and the operator is ready, give the command below for the same new SSH session. Look for `COMMITTED`, then have the operator reconnect on the selected port.
 
-When the operator needs to do something, say where to run the command and give one copy-paste command for that action. Fill in known values and label any remaining placeholders. Say what success looks like or which output to share. Keep passwords and private-key passphrases in the operator's own terminal.
+   ```bash
+   sudo /usr/bin/python3 /var/lib/vps-phase1/RUN_ID/phase1.py commit --run-id RUN_ID --external-checks-passed
+   ```
 
-If the operator lacks the VPS host fingerprint, have them run this in the provider console and share the `SHA256:...` value.
-
-```bash
-ssh-keygen -E sha256 -lf /etc/ssh/ssh_host_ed25519_key.pub
-```
-
-To get the operator key fingerprint, have them run this on their computer using their actual public key path.
-
-```bash
-ssh-keygen -E sha256 -lf ~/.ssh/id_ed25519.pub
-```
-
-To prove operator SSH and sudo access, give this command with the actual address, administrator, port, and private key path. Use the current port before staging and the target port afterward. The new shell confirms SSH and sudo worked. Before commit, ask the operator to keep that shell open.
-
-```bash
-ssh -F /dev/null -t -p 22 -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o ControlMaster=no -o ControlPath=none ubuntu@VPS_IP 'sudo -v && exec "$SHELL" -l'
-```
-
-## Call the Script
-
-1. **Plan a new setup.** Verify the VPS host key, use the operator-approved SSH access, and run the reviewed script as root from a root-owned location on the VPS. Run `plan --admin <user> --operator-key-fingerprint <fingerprint>`. Add `--ssh-port <port>` for a custom target. Let `plan` check the operator key in both accounts. If it reports missing key material, ask the operator to install their public key for the named account, or do it with authorization, then rerun `plan`.
-2. **Apply when authorized.** Before running `apply`, have the operator confirm a fresh key-only login and sudo as the administrator using their own key. Confirm recovery access. Reuse the reviewed plan options and report the run ID and rollback deadline. For a request to preview only, return the plan results.
-3. **Use the saved runner for follow-up commands.** Call `verify`, `commit`, or `rollback` with `--run-id`. Before `commit`, confirm fresh operator-key SSH and sudo on the target port and successful external checks from the README. Pass `--external-checks-passed` only once those checks pass. Use the operator's fresh SSH session for commit. If only a temporary agent login is available, give the operator the exact command to run from their session.
-
-## Update the Operator Along the Way
-
-- Report a useful result at each completed phase, such as verified access, a plan decision, staging, verification, commit, or rollback. Include the next action or approval needed.
-- After staging, include the run ID and rollback deadline in the operator's time zone when known. If a blocker appears while the timer is active, report what failed and the time remaining.
-- During longer operations, report meaningful changes, such as package upgrades finishing or the VPS returning after reboot. Keep routine command output out of progress updates.
-
-Follow the operator's approval instructions before each action that requires approval. Use the [extended scenarios](references/scenarios.md) when the operator specifically requests a live validation campaign.
+For a failed check, explain what failed and how much time remains before automatic rollback if the deadline is known. Help the operator resolve it or [restore the uncommitted run](../../../README.md#restore-an-uncommitted-run) with the saved script's `rollback --run-id RUN_ID` command. At each completed step, confirm the result briefly and give the next action.
