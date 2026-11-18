@@ -8,6 +8,7 @@ import json
 import hashlib
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import stat
 import tempfile
 import time
@@ -17,6 +18,10 @@ from unittest.mock import Mock, patch
 SPEC = importlib.util.spec_from_file_location('phase1', Path(__file__).parents[1] / 'scripts/phase1.py')
 p = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(p)
+
+OPERATOR_FINGERPRINT = 'SHA256:' + 'A' * 43
+TEMPORARY_FINGERPRINT = 'SHA256:' + 'B' * 43
+KEY_OPTION = ['--operator-key-fingerprint', OPERATOR_FINGERPRINT]
 
 
 class PureTests(unittest.TestCase):
@@ -46,11 +51,18 @@ class PureTests(unittest.TestCase):
     def test_plan_and_apply_accept_the_same_rollback_window(self):
         for command in ('plan', 'apply'):
             with self.subTest(command=command):
-                self.assertEqual(p.parser().parse_args([command]).rollback_minutes, 20)
-                self.assertEqual(p.parser().parse_args([command, '--rollback-minutes', '30']).rollback_minutes, 30)
+                self.assertEqual(p.parser().parse_args([command, *KEY_OPTION]).rollback_minutes, 20)
+                self.assertEqual(p.parser().parse_args([command, *KEY_OPTION, '--rollback-minutes', '30']).rollback_minutes, 30)
                 for value in ('4', '121', 'not-a-number'):
                     with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-                        p.parser().parse_args([command, '--rollback-minutes', value])
+                        p.parser().parse_args([command, *KEY_OPTION, '--rollback-minutes', value])
+
+    def test_plan_and_apply_require_valid_operator_key_fingerprint(self):
+        for command in ('plan', 'apply'):
+            for options in ([], ['--operator-key-fingerprint', 'MD5:01:23']):
+                with self.subTest(command=command, options=options), \
+                     contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    p.parser().parse_args([command, *options])
 
     def test_reserved_and_invalid_ports_rejected(self):
         for value in (0, -1, 65536, 'oops', 80, 443, 3000, 2375, 6379):
@@ -170,6 +182,50 @@ class PureTests(unittest.TestCase):
                 p.validate_config({'admin': 'ubuntu'}, [2222])
 
 
+class OperatorKeyTests(unittest.TestCase):
+    def test_preflight_rejects_temporary_key_only_for_either_account(self):
+        with tempfile.TemporaryDirectory() as folder:
+            host = Path(folder)
+            os_release = host / 'os-release'
+            os_release.write_text('ID=ubuntu\nVERSION_ID="24.04"\n')
+            systemd = host / 'systemd'
+            systemd.mkdir()
+            accounts = {}
+            for name, uid in (('root', 0), ('ubuntu', 1000)):
+                home = host / name
+                auth = home / '.ssh/authorized_keys'
+                auth.parent.mkdir(parents=True)
+                auth.touch()
+                accounts[name] = SimpleNamespace(pw_name=name, pw_uid=uid, pw_dir=str(home))
+
+            def local_path(value):
+                return {'/etc/os-release': os_release, '/run/systemd/system': systemd}.get(value, Path(value))
+
+            args = p.parser().parse_args(['apply', *KEY_OPTION])
+            for missing in ('root', 'ubuntu', None):
+                with self.subTest(missing=missing):
+                    def run_command(*args, **kwargs):
+                        if args == ('id', '-nG', 'ubuntu'):
+                            return 'ubuntu sudo'
+                        if args[:5] == ('ssh-keygen', '-E', 'sha256', '-l', '-f'):
+                            account = Path(args[5]).parent.parent.name
+                            listing = f'256 {TEMPORARY_FINGERPRINT} test-{OPERATOR_FINGERPRINT} (ED25519)'
+                            if account != missing:
+                                listing += f'\n256 {OPERATOR_FINGERPRINT} operator (ED25519)'
+                            return listing
+                        if args == ('/usr/sbin/sshd', '-t'):
+                            raise p.Error('Reached SSH configuration check')
+                        self.fail(f'Unexpected command: {args}')
+
+                    with patch.object(p, 'Path', side_effect=local_path), \
+                         patch.object(p.pwd, 'getpwnam', side_effect=accounts.__getitem__), \
+                         patch.object(p.shutil, 'which', return_value='/mock/tool'), \
+                         patch.object(p, 'run', side_effect=run_command):
+                        expected = f'was not found for {missing}' if missing else 'Reached SSH configuration check'
+                        with self.assertRaisesRegex(p.Error, expected):
+                            p.preflight(args)
+
+
 class FileAndTransactionTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -283,7 +339,7 @@ class FileAndTransactionTests(unittest.TestCase):
         self.disarm.assert_not_called()
 
     def test_plan_does_not_write_files_or_run_package_changes(self):
-        args = p.parser().parse_args(['plan', '--skip-packages', '--rollback-minutes', '30'])
+        args = p.parser().parse_args(['plan', *KEY_OPTION, '--skip-packages', '--rollback-minutes', '30'])
         original = set(self.root.rglob('*'))
         with patch.object(p, 'preflight', return_value=self.base), contextlib.redirect_stdout(io.StringIO()) as output:
             p.plan(args)
@@ -376,6 +432,20 @@ class FileAndTransactionTests(unittest.TestCase):
         stack.enter_context(patch.object(p, 'audit', return_value=[]))
         stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
         return stack
+
+    def test_commit_refuses_if_operator_key_was_removed_after_staging(self):
+        folder, state = self.transaction()
+        state['operator_key_fingerprint'] = OPERATOR_FINGERPRINT
+        account = SimpleNamespace(pw_name='ubuntu', pw_dir='/home/ubuntu')
+        with self.commit_patches(), patch.object(p.pwd, 'getpwnam', return_value=account), \
+             patch.object(p, 'check_operator_key', side_effect=p.Error('Operator key was not found')) as key_check, \
+             patch.object(p, 'activate') as activate:
+            with self.assertRaisesRegex(p.Error, 'Operator key was not found'):
+                p.commit(argparse.Namespace(external_checks_passed=True), folder, state)
+        key_check.assert_called_once_with(account, OPERATOR_FINGERPRINT)
+        activate.assert_not_called()
+        self.disarm.assert_not_called()
+        self.assertEqual(state['status'], 'awaiting_commit')
 
     def test_commit_removes_old_port_only_after_new_session_check(self):
         folder, state = self.transaction()

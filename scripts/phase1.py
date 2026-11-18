@@ -386,6 +386,23 @@ def safety_checks(ufw=None):
             raise Error(f'Unrecognized firewall tables: {sorted(unknown)}. Refusing to replace policy.')
 
 
+def operator_key_fingerprint(value: str) -> str:
+    if not re.fullmatch(r'SHA256:[A-Za-z0-9+/]{43}', value):
+        raise argparse.ArgumentTypeError('Use the SHA256 fingerprint from ssh-keygen -E sha256 -lf KEY.pub.')
+    return value
+
+
+def check_operator_key(account: pwd.struct_passwd, fingerprint: str) -> Path:
+    auth = Path(account.pw_dir) / '.ssh/authorized_keys'
+    if not auth.is_file():
+        raise Error(f'Install the operator public key for {account.pw_name} in {auth}.')
+    listing = run('ssh-keygen', '-E', 'sha256', '-l', '-f', str(auth), check=False)
+    if not any(len(fields) >= 2 and fields[1] == fingerprint
+               for fields in (line.split(maxsplit=2) for line in listing.splitlines())):
+        raise Error(f'Operator key {fingerprint} was not found for {account.pw_name} in {auth}.')
+    return auth
+
+
 def preflight(args) -> dict:
     osinfo = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines()
                   if '=' in line)
@@ -406,10 +423,8 @@ def preflight(args) -> dict:
         raise Error('The administrator must be non-root.')
     if 'sudo' not in run('id', '-nG', args.admin).split():
         raise Error('The administrator must be in Ubuntu’s sudo group; test sudo access first.')
-    auth = Path(account.pw_dir) / '.ssh/authorized_keys'
-    if not auth.is_file() or not auth.read_text().strip():
-        raise Error(f'Provision and test a public SSH key in {auth} first.')
-    run('ssh-keygen', '-l', '-f', str(auth))
+    check_operator_key(pwd.getpwnam('root'), args.operator_key_fingerprint)
+    auth = check_operator_key(account, args.operator_key_fingerprint)
     run('/usr/sbin/sshd', '-t')
     info = session()
     config = ssh_config(args.admin, info['client'] if info else None)
@@ -451,7 +466,8 @@ def preflight(args) -> dict:
     interfaces = choose_interfaces(addresses, routes, args.interface)
     ufw = inspect_ufw()
     safety_checks(ufw)
-    return {'admin': args.admin, 'port': target, 'previous_ports': ports,
+    return {'admin': args.admin, 'operator_key_fingerprint': args.operator_key_fingerprint,
+            'port': target, 'previous_ports': ports,
             'stage_ports': sorted(set(ports + [target])), 'interfaces': interfaces,
             'socket': active('ssh.socket'), 'client': info['client'] if info else None, 'ufw': ufw}
 
@@ -868,9 +884,10 @@ def apply(args):
     print(f"\nSTAGED RUN: {state['id']}")
     print('Backups and root-owned runner:', folder)
     print('Automatic rollback deadline:', dt.datetime.fromtimestamp(state['deadline'], dt.timezone.utc).isoformat())
-    print('Keep this session open. Test a NEW key login with SSH multiplexing disabled:')
-    print(f"ssh -p {state['port']} -o ControlMaster=no -o ControlPath=none {state['admin']}@VPS_IP")
-    print('After sudo and external IPv4/IPv6 tests, commit FROM THAT NEW SESSION:')
+    print('Keep this session open. The operator must test their key from a fresh SSH session:')
+    print(f"ssh -F /dev/null -i OPERATOR_PRIVATE_KEY -o IdentitiesOnly=yes -o IdentityAgent=none "
+          f"-o ControlMaster=no -o ControlPath=none -p {state['port']} {state['admin']}@VPS_IP")
+    print("After sudo and external IPv4/IPv6 tests, commit from the operator's new session:")
     print(f'sudo /usr/bin/python3 {folder}/phase1.py commit --run-id {state["id"]} --external-checks-passed')
     print('Do not install Docker or reboot before committing. Package upgrades are not rolled back.')
 
@@ -885,6 +902,9 @@ def commit(args, folder: Path, state: dict):
         raise Error('Complete external IPv4/IPv6 listener tests and pass --external-checks-passed.')
     info = session()
     check_commit_session(info, state, os.environ.get('SUDO_USER'))
+    fingerprint = state.get('operator_key_fingerprint')
+    if fingerprint is not None:
+        check_operator_key(pwd.getpwnam(state['admin']), fingerprint)
     state['client'] = info['client']
     if not active(TIMER + '.timer'):
         raise Error('Rollback timer is not active. Restore it or roll back before committing.')
@@ -916,6 +936,8 @@ def parser():
     for mode in ('plan', 'apply'):
         p = sub.add_parser(mode, help='Read-only preview' if mode == 'plan' else 'Stage with timed rollback')
         p.add_argument('--admin', default='ubuntu')
+        p.add_argument('--operator-key-fingerprint', required=True, type=operator_key_fingerprint,
+                       metavar='SHA256:FINGERPRINT', help='Operator public key installed for root and the administrator')
         p.add_argument('--ssh-port', type=int, help='Keep current port by default; e.g. 2222 to migrate')
         p.add_argument('--interface', action='append', default=[], help='Repeat for each public uplink; otherwise detected')
         p.add_argument('--skip-packages', action='store_true', help='For already-patched hosts with all prerequisites installed')

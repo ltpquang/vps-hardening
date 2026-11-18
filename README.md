@@ -26,7 +26,7 @@ This guide is for someone who can connect with SSH and use `sudo`, but has not c
 
 ## Scope and Security Policy
 
-**Supported:** a booted Ubuntu 24.04 LTS system using systemd and OpenSSH, before Docker or applications are installed. Python 3 uses only its standard library. The administrator must already exist, belong to the `sudo` group, and have a tested public key in their home directory's `.ssh/authorized_keys`.
+**Supported:** a booted Ubuntu 24.04 LTS system using systemd and OpenSSH, before Docker or applications are installed. Python 3 uses only its standard library. The administrator must already exist and belong to the `sudo` group. Install the operator's public key in both the root and administrator `.ssh/authorized_keys` files, and test login and sudo using the corresponding private key before staging.
 
 Examples use `ubuntu`. **That is a username**, common on Ubuntu cloud images, rather than a command or a required account name. Substitute your actual non-root administrator with `--admin`.
 
@@ -116,14 +116,25 @@ ssh-keygen -t ed25519 -f ~/.ssh/vps_admin
 
 **Expected:** prompts for a passphrase, then paths for a private key and a `.pub` public key. Choose a passphrase. Do not overwrite an existing key or copy the private key to the VPS.
 
-Replace `VPS_IP` with your server address. These examples assume the current SSH port is `22`; use the actual port if different:
+Install the same operator public key in `/root/.ssh/authorized_keys` and in the administrator's `.ssh/authorized_keys`. Preserve existing entries. Use the provider console or existing sudo access to install the key on accounts that cannot accept an SSH login yet. Root can remain locked to SSH on images that already disable it.
+
+To use `ssh-copy-id` for accounts with working SSH access, replace `VPS_IP` with your server address and use your current SSH port. The examples use port `22`.
 
 ```bash
+# Run the root command only if root SSH is already available.
+ssh-copy-id -p 22 -i ~/.ssh/vps_admin.pub root@VPS_IP
 ssh-copy-id -p 22 -i ~/.ssh/vps_admin.pub ubuntu@VPS_IP
-ssh -p 22 -i ~/.ssh/vps_admin -o IdentitiesOnly=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no ubuntu@VPS_IP
 ```
 
-**Expected:** `ssh-copy-id` installs the public key using existing access. The second command opens a shell using that key, possibly asking for its local passphrase. A server-account password prompt is not acceptable for this test. If password login was never available, provision the public key through the provider console instead.
+**On the operator's computer**, verify fresh login with the operator's private key. If root SSH is available, run the same test as `root` before staging.
+
+```bash
+ssh -F /dev/null -p 22 -i ~/.ssh/vps_admin \
+    -o IdentitiesOnly=yes -o IdentityAgent=none -o PreferredAuthentications=publickey \
+    -o ControlMaster=no -o ControlPath=none ubuntu@VPS_IP
+```
+
+**Expected:** a fresh shell opens using the specified key. An encrypted private key may prompt for its local passphrase. If the connection fails, verify account access through the provider console before staging.
 
 **In that new VPS shell:**
 
@@ -131,7 +142,15 @@ ssh -p 22 -i ~/.ssh/vps_admin -o IdentitiesOnly=yes -o PasswordAuthentication=no
 sudo -v
 ```
 
-**Expected:** sudo succeeds. Confirm that `.ssh` and `authorized_keys` are owned by this administrator with permissions `700` and `600`, respectively, when installing the key manually. Avoid SSH agent forwarding (`ssh -A`) during ordinary administration.
+**Expected:** sudo succeeds. For manually installed keys, confirm that each account owns its `.ssh` directory and `authorized_keys`, with modes `700` and `600` respectively. Avoid SSH agent forwarding (`ssh -A`) during ordinary administration.
+
+**On the operator's computer**, get the fingerprint to pass to `plan` and `apply`.
+
+```bash
+ssh-keygen -E sha256 -lf ~/.ssh/vps_admin.pub
+```
+
+Copy the `SHA256:...` value from the output. Use the key that the operator will retain after temporary keys are removed.
 
 ## 2. Review and Copy the Script
 
@@ -178,14 +197,19 @@ ip -6 route show default
 
 The script discovers default-route interfaces and interfaces with global addresses. Inspect the result; provider-specific routed or tunneled networks can require manual review.
 
+Set `OPERATOR_KEY_FINGERPRINT` in the VPS shell to the value copied from the operator's computer.
+
 ```bash
-sudo /usr/bin/python3 /root/bootstrap/phase1.py plan --admin ubuntu
+OPERATOR_KEY_FINGERPRINT='SHA256:REPLACE_WITH_OPERATOR_FINGERPRINT'
+sudo /usr/bin/python3 /root/bootstrap/phase1.py plan --admin ubuntu \
+    --operator-key-fingerprint "$OPERATOR_KEY_FINGERPRINT"
 ```
 
-**Success:** `PLAN ONLY` confirms a read-only preview. Review the administrator, interfaces, SSH ports, and proposed changes before applying.
+**Success:** `PLAN ONLY` confirms a read-only preview. The fingerprint must match a key installed for both root and the administrator. Review the interfaces, SSH ports, and proposed changes before applying.
 
 | Option | Use |
 | --- | --- |
+| `--operator-key-fingerprint` | Require the operator key in both accounts |
 | Omit `--ssh-port` | Keep the current SSH port |
 | `--ssh-port 2222` | Stage a migration to port 2222 |
 | `--interface ens3` | Explicitly select one public uplink |
@@ -197,7 +221,8 @@ sudo /usr/bin/python3 /root/bootstrap/phase1.py plan --admin ubuntu
 For example, a migration on an `ens3` host is previewed with:
 
 ```bash
-sudo /usr/bin/python3 /root/bootstrap/phase1.py plan --admin ubuntu --interface ens3 --ssh-port 2222
+sudo /usr/bin/python3 /root/bootstrap/phase1.py plan --admin ubuntu \
+    --operator-key-fingerprint "$OPERATOR_KEY_FINGERPRINT" --interface ens3 --ssh-port 2222
 ```
 
 **Review:** the selected port must be `2222`, the interface must be `ens3`, and the staging ports must include the old port. The script rejects a list that omits a detected uplink.
@@ -218,10 +243,11 @@ The script saves `/etc/ufw/` and `/etc/default/ufw`, arms rollback, and activate
 
 ## 4. Apply with Timed Rollback
 
-Use the same administrator, interface, port, and package options that you reviewed. This example keeps the current port and uses automatic interface detection:
+Use the same administrator, operator fingerprint, interface, port, and package options that you reviewed. This example keeps the current port and uses automatic interface detection.
 
 ```bash
-sudo /usr/bin/python3 /root/bootstrap/phase1.py apply --admin ubuntu
+sudo /usr/bin/python3 /root/bootstrap/phase1.py apply --admin ubuntu \
+    --operator-key-fingerprint "$OPERATOR_KEY_FINGERPRINT"
 ```
 
 **Success:** `STAGED RUN: RUN_ID` appears with a rollback deadline, backup directory, and next commands. Configuration awaits confirmation; both old and selected SSH ports remain permitted. Continue with a new SSH session before the deadline.
@@ -234,13 +260,15 @@ If staging fails, the script attempts rollback immediately. A lost terminal or i
 
 ## 5. Verify from a New SSH Session
 
-**On your computer**, open a second terminal. Use the port selected by apply; `22` below is an example:
+**On the operator's computer**, open a second terminal. Use the same private key whose fingerprint was passed to `apply`. Replace port `22` with the selected port if it changed.
 
 ```bash
-ssh -p 22 -i ~/.ssh/vps_admin -o IdentitiesOnly=yes -o ControlMaster=no -o ControlPath=none -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no ubuntu@VPS_IP
+ssh -F /dev/null -p 22 -i ~/.ssh/vps_admin \
+    -o IdentitiesOnly=yes -o IdentityAgent=none -o PreferredAuthentications=publickey \
+    -o ControlMaster=no -o ControlPath=none ubuntu@VPS_IP
 ```
 
-**Expected:** a fresh key-authenticated shell. The multiplexing options prevent SSH from reusing the old connection. An old connection can survive a broken new-login configuration, so it cannot establish that the new settings work.
+**Expected:** a fresh shell authenticates with the operator's key. This proves the operator can use the key under the staged configuration. Complete this check even if a temporary test key has already worked.
 
 **In the new VPS session:**
 
@@ -330,7 +358,7 @@ When another upstream firewall exists, an external failure establishes combined 
 
 ## 7. Commit, Reconnect, and Reboot
 
-After the new key login, sudo, local audit, and applicable external tests pass, run this **from the new administrator SSH session**:
+After the operator's new key login, sudo, local audit, and applicable external tests pass, run this **from the operator's new administrator SSH session**. The script rechecks that the operator key is still installed for the administrator.
 
 ```bash
 sudo /usr/bin/python3 /var/lib/vps-phase1/RUN_ID/phase1.py commit --run-id RUN_ID --external-checks-passed
@@ -537,6 +565,7 @@ python3 -m py_compile scripts/phase1.py tests/test_phase1.py
 
 Before releasing a version for production use, test it on a disposable Ubuntu 24.04 VPS with working console access:
 
+- **Operator access:** verify that either account having only a temporary key makes preflight fail. Prove the operator's own administrator key login and sudo before staging and before commit.
 - **SSH modes:** test the image's default socket activation and service-based activation.
 - **Port choices:** test retaining the existing port and migrating to another port.
 - **Network families:** test IPv4 and IPv6 listeners from outside the VPS, before and after reboot.
