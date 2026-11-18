@@ -12,7 +12,7 @@ import stat
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 SPEC = importlib.util.spec_from_file_location('phase1', Path(__file__).parents[1] / 'scripts/phase1.py')
 p = importlib.util.module_from_spec(SPEC)
@@ -292,6 +292,39 @@ class FileAndTransactionTests(unittest.TestCase):
         self.assertEqual(set(self.root.rglob('*')), original)
         self.assertEqual(self.commands, [])
 
+    def test_apply_starts_socket_activated_ssh_before_post_package_preflight(self):
+        for socket_active, service_active, skip_packages in (
+            (True, False, False),
+            (True, True, False),
+            (False, True, False),
+            (True, False, True),
+        ):
+            with self.subTest(socket_active=socket_active, service_active=service_active,
+                              skip_packages=skip_packages):
+                args = argparse.Namespace(skip_packages=skip_packages, rollback_minutes=20)
+                units = {'ssh.socket': socket_active, 'ssh.service': service_active}
+                calls = Mock()
+                with patch.object(p, 'preflight', side_effect=[self.base, p.Error('second preflight')]) as preflight, \
+                     patch.object(p, 'active', side_effect=lambda unit: units.get(unit, False)), \
+                     patch.object(p.shutil, 'which', return_value='/mock/tool'), \
+                     patch.object(p.subprocess, 'run') as packages, patch.object(p, 'run') as command, \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    packages.return_value.returncode = 0
+                    calls.attach_mock(preflight, 'preflight')
+                    calls.attach_mock(packages, 'package')
+                    calls.attach_mock(command, 'command')
+                    with self.assertRaisesRegex(p.Error, 'second preflight'):
+                        p.apply(args)
+
+                expected = ['preflight']
+                if not skip_packages:
+                    expected.extend(['package'] * 3)
+                if socket_active and not service_active and not skip_packages:
+                    expected.append('command')
+                    command.assert_called_once_with('systemctl', 'start', 'ssh.service')
+                expected.append('preflight')
+                self.assertEqual([call[0] for call in calls.mock_calls], expected)
+
     def test_staging_failure_automatically_restores_backup(self):
         args = argparse.Namespace(skip_packages=True, rollback_minutes=20)
         Path(self.names[0]).parent.mkdir(parents=True)
@@ -386,10 +419,16 @@ class UfwMigrationTests(unittest.TestCase):
         self.defaults = self.root / 'etc/default/ufw'
         self.defaults.parent.mkdir()
         self.defaults.write_text('DEFAULT_INPUT_POLICY="DROP"\n')
+        self.conffiles = f' {self.defaults} {hashlib.md5(self.defaults.read_bytes()).hexdigest()}'
+        self.package_md5sums = ''
+        for name in ('before.rules', 'before6.rules', 'after.rules', 'after6.rules',
+                     'before.init', 'after.init'):
+            path = self.ufw / name
+            path.write_text('*filter\nCOMMIT\n' if name.endswith('.rules') else '#!/bin/sh\n')
+            packaged = f'iptables/{name}' if name.endswith('.rules') else name
+            digest = hashlib.md5(path.read_bytes()).hexdigest()
+            self.package_md5sums += f'{digest}  usr/share/ufw/{packaged}\n'
         self.before = self.ufw / 'before.rules'
-        self.before.write_text('*filter\nCOMMIT\n')
-        self.conffiles = '\n'.join(f' {path} {hashlib.md5(path.read_bytes()).hexdigest()}'
-                                   for path in (self.defaults, self.before))
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
         self.stack.enter_context(patch.object(p, 'UFW_ROOT', self.ufw))
@@ -398,8 +437,10 @@ class UfwMigrationTests(unittest.TestCase):
 
     def inspect(self, status='Status: inactive', added='Added user rules:'):
         def fake_run(*args, **kwargs):
-            if args[0] == 'dpkg-query':
+            if args == ('dpkg-query', '-W', '-f=${Conffiles}', 'ufw'):
                 return self.conffiles
+            if args == ('dpkg-query', '--control-show', 'ufw', 'md5sums'):
+                return self.package_md5sums
             return added if args[1:3] == ('show', 'added') else status
         with patch.object(p, 'active', return_value=True), \
              patch.object(p, 'enabled', return_value=True), \
@@ -425,7 +466,19 @@ class UfwMigrationTests(unittest.TestCase):
 
     def test_changed_before_rules_require_review(self):
         self.before.write_text('custom policy')
+        self.assertEqual(self.inspect()['review_reasons'],
+                         [f'{self.before} differs from the packaged configuration'])
+
+    def test_missing_template_checksums_require_review(self):
+        self.package_md5sums = ''
         self.assertTrue(self.inspect()['requires_confirmation'])
+
+    def test_symlink_to_stock_template_requires_review(self):
+        target = self.root / 'stock-before.rules'
+        self.before.rename(target)
+        self.before.symlink_to(target)
+        self.assertEqual(self.inspect()['review_reasons'],
+                         [f'{self.before} differs from the packaged configuration'])
 
     def test_unknown_runtime_status_is_rejected(self):
         with self.assertRaisesRegex(p.Error, 'runtime state'):

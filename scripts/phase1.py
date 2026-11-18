@@ -324,11 +324,26 @@ def inspect_ufw() -> dict | None:
     # Custom before/after rules or defaults must not be silently discarded.
     conffiles = run('dpkg-query', '-W', '-f=${Conffiles}', 'ufw')
     hashes = dict(re.findall(r'^\s*(/\S+)\s+([a-f0-9]{32})(?:\s+obsolete)?\s*$', conffiles, re.M))
-    for path in (UFW_DEFAULT, *(UFW_ROOT / n for n in
-                  ('before.rules', 'before6.rules', 'after.rules', 'after6.rules',
-                   'before.init', 'after.init', 'sysctl.conf'))):
-        if path.exists() and (path.is_symlink() or hashes.get(str(path)) !=
-                              hashlib.md5(path.read_bytes(), usedforsecurity=False).hexdigest()):
+    # Ubuntu's UFW package installs these files from templates outside /etc.
+    # Compare against package checksums so a modified template cannot hide a local edit.
+    checksums = run('dpkg-query', '--control-show', 'ufw', 'md5sums', check=False)
+    template_hashes = {path: digest for digest, path in
+                       re.findall(r'^([a-f0-9]{32})[ \t]+(\S+)$', checksums, re.M)}
+    templates = {
+        'before.rules': 'iptables/before.rules',
+        'before6.rules': 'iptables/before6.rules',
+        'after.rules': 'iptables/after.rules',
+        'after6.rules': 'iptables/after6.rules',
+        'before.init': 'before.init',
+        'after.init': 'after.init',
+    }
+    for name, template in templates.items():
+        digest = template_hashes.get(f'usr/share/ufw/{template}')
+        if digest is not None:
+            hashes.setdefault(str(UFW_ROOT / name), digest)
+    for path in (UFW_DEFAULT, *(UFW_ROOT / name for name in (*templates, 'sysctl.conf'))):
+        if path.is_symlink() or (path.exists() and hashes.get(str(path)) !=
+                                 hashlib.md5(path.read_bytes(), usedforsecurity=False).hexdigest()):
             reasons.append(f'{path} differs from the packaged configuration')
     return {'running': running, 'unit': unit, 'status': status, 'added_rules': added,
             'review_reasons': reasons, 'requires_confirmation': bool(reasons)}
@@ -822,6 +837,9 @@ def apply(args):
             print('Running', shlex.join(command), flush=True)
             if subprocess.run(command, env=env).returncode:
                 raise Error('Package operation failed. No script-managed network changes have been made.')
+        # OpenSSH upgrades can leave only the socket active. The service creates /run/sshd.
+        if active('ssh.socket') and not active('ssh.service'):
+            run('systemctl', 'start', 'ssh.service')
     for command in ('nft', 'fail2ban-client', 'unattended-upgrade'):
         if not shutil.which(command):
             raise Error(f'Missing {command}; install prerequisites or omit --skip-packages.')
